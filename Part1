@@ -1,0 +1,479 @@
+
+MIGRATION RUNBOOK
+PART 1 OF 2
+Enabling Replication: vCenter  →  Nutanix NC2
+Prerequisites  •  Move Appliance Deployment  •  Agent Installation  •  Replication Configuration
+Field	Details
+Source Environment	VMware vCenter (6.5 / 6.7 / 7.0 / 8.x)
+Target Environment	Nutanix NC2 (AHV) — AWS or Azure
+Replication Tool	Nutanix Move (formerly Xtract for VMs)
+Agent Requirement	Move Agent on Windows/Linux VMs (recommended)
+Document Part	Part 1 of 2 — Replication Setup
+Version	1.0
+Prepared By	[Migration Team / Name]
+Date	April 2026
+
+⚠️  IMPORTANT:  All prerequisite steps in this runbook must be completed and verified before initiating replication. Engage the VMware admin, Nutanix/cloud admin, and network team in parallel to reduce lead time.
+ 
+1. Overview & Architecture
+This runbook covers all prerequisite steps and configuration actions required to enable virtual machine replication from a VMware vCenter source environment to a Nutanix NC2 (Nutanix Cloud Clusters) target environment. The primary replication tool used is Nutanix Move — a purpose-built, agentless/agent-assisted VM migration appliance.
+
+1.1 Replication Tool: Nutanix Move
+Nutanix Move (formerly Xtract for VMs) is a free migration appliance provided by Nutanix. It is deployed as a virtual appliance (OVA/OVF) on the source vCenter environment and orchestrates:
+•	Discovery of VMs from vCenter
+•	Snapshot-based disk replication to Nutanix AHV (NC2)
+•	Incremental (delta) sync cycles to minimize cutover downtime
+•	Driver injection and NIC conversion for AHV compatibility
+•	Optional agent-based replication for improved performance and reduced RPO
+
+1.2 High-Level Architecture
+The replication flow is as follows:
+
+①	VMware vCenter + ESXi Hosts  (Source VMs)	→	Nutanix Move Appliance  (Replication Engine)	→	Nutanix NC2 / AHV  (Target)
+
+1.3 Replication Modes
+Mode	Description	Use Case
+Agentless	Move connects via vCenter APIs, uses VMware CBT (Changed Block Tracking) for incremental sync. No agent installed on source VMs.	General migrations; VMs where agent installation is not permitted
+Agent-Based	Move Agent installed on source VM guest OS. Provides better performance, reduced RPO, and supports VMs not visible via vCenter.	Preferred mode for production VMs; supports physical-to-virtual (P2V)
+
+ 
+2. Prerequisites Checklist
+Complete all items below before beginning deployment steps. Use this as your go/no-go gate.
+
+#	Prerequisite Item	Owner	Status
+1	vCenter credentials (admin-level) available	VMware Admin	☐  Pending
+2	NC2 cluster provisioned and Prism Element accessible	Cloud/Nutanix Admin	☐  Pending
+3	Network path exists between source vCenter and NC2 (VPN/DC/ER)	Network Admin	☐  Pending
+4	Firewall rules identified and approved	Security/Network	☐  Pending
+5	Nutanix Move OVA downloaded from Nutanix Portal	Migration Lead	☐  Pending
+6	Datastore with 50 GB+ free space available for Move appliance	VMware Admin	☐  Pending
+7	vCenter service account for Move created with required privileges	VMware Admin	☐  Pending
+8	Nutanix Prism service account for Move created	Nutanix Admin	☐  Pending
+9	CBT (Changed Block Tracking) enabled on source VMs	VMware Admin	☐  Pending
+10	Move Agent installer staged on target VMs (if agent mode)	Migration Lead	☐  Pending
+11	Target network/VLAN mapping documented	Network Admin	☐  Pending
+12	Target storage container created on NC2	Nutanix Admin	☐  Pending
+13	VM inventory list (scope) finalised and approved	App Owner	☐  Pending
+14	Maintenance/migration window approved	Change Manager	☐  Pending
+
+ 
+3. Source Environment Preparation (VMware vCenter)
+3.1 vCenter Service Account Setup
+
+STEP
+1	Create Dedicated vCenter Service Account for Nutanix Move
+	1. Log in to vCenter as an SSO administrator.
+2. Navigate to: Administration → Single Sign On → Users and Groups → Users.
+3. Create a new user: move-svc@vsphere.local (or your SSO domain).
+4. Assign the following vCenter role permissions at the Datacenter level (propagate to children):
+
+   DATASTORE:  Browse Datastore, Low-Level File Operations, Update VM Files
+   NETWORK:    Assign Network
+   RESOURCE:   Assign VM to Resource Pool
+   VIRTUAL MACHINE → Configuration:  All privileges
+   VIRTUAL MACHINE → Snapshot Mgmt:  All privileges (Create, Remove, Revert, Rename)
+   VIRTUAL MACHINE → Provisioning:   Allow Disk Access, Allow Read-Only Disk Access
+   VIRTUAL MACHINE → Interaction:    Power On, Power Off, Suspend
+   GLOBAL:     Cancel Task, Diagnostics
+   HOST:       Configuration → Storage Partition Configuration (if direct ESXi access needed)
+
+5. Note the service account credentials securely for Move appliance configuration.
+
+3.2 Enable Changed Block Tracking (CBT) on Source VMs
+
+📋  What is CBT?  Changed Block Tracking (CBT) is a VMware feature that tracks disk blocks changed since the last snapshot. Nutanix Move uses CBT for incremental (delta) sync cycles, dramatically reducing replication time after the initial full copy.
+
+STEP
+2	Enable CBT on Source VMs via vCenter
+	1. Power off the VM (CBT requires the VM to be powered off for the initial enablement).
+   Note: Move can enable CBT automatically if the service account has sufficient privileges.
+
+2. In vCenter, right-click the VM → Edit Settings → VM Options → Advanced → Configuration Parameters.
+3. Add or verify these parameters are set:
+   ctkEnabled = TRUE
+   scsi0:0.ctkEnabled = TRUE   (repeat for each disk: scsi0:1, scsi0:2, etc.)
+
+4. Power the VM back on. Take a snapshot, then delete it — this initialises the CTK files.
+
+5. Alternatively, use PowerCLI to enable CBT in bulk:
+   $vm = Get-VM "VM-Name"
+   $vm | Get-View | % { $_.ReconfigVM_Task(@{changeVersion=$_.Config.ChangeVersion; extraConfig=@(@{key="ctkEnabled";value="true"})}) }
+
+6. Verify: Right-click VM → Edit Settings → confirm ctkEnabled = true in config params.
+
+
+3.3 Prepare ESXi Host Access
+
+STEP
+3	Validate ESXi Host Connectivity for Move Appliance
+	1. Confirm that the Nutanix Move appliance VM (deployed in next section) will have network
+   access to all ESXi hosts that host the VMs in scope.
+2. Verify VMware NFC (Network File Copy) port TCP 902 is reachable from Move appliance to ESXi hosts.
+3. If using vSAN or NFS datastores, confirm Move appliance can reach the storage network.
+4. Confirm ESXi hosts are running ESXi 6.0 or later (required by Nutanix Move).
+5. Ensure sufficient snapshot space on the datastores hosting source VMs:
+   Rule of thumb: Reserve 20-30% additional free space per datastore for snapshot delta files.
+
+
+ 
+4. Nutanix Move Appliance — Deployment on vCenter
+4.1 Download Nutanix Move OVA
+
+STEP
+4	Download Move Appliance from Nutanix Support Portal
+	1. Log in to Nutanix Support Portal: https://portal.nutanix.com
+2. Navigate to: Downloads → Tools & Firmware → Nutanix Move.
+3. Download the latest Move OVA (e.g., move-5.x.x.ova).
+4. Verify the SHA-256 checksum of the downloaded OVA against the portal-published hash.
+5. Stage the OVA file on a system that has browser/client access to the vCenter web interface.
+
+4.2 Deploy Move Appliance OVA on vCenter
+
+STEP
+5	Deploy Move OVA via vCenter Web Client
+	1. Log in to vCenter Web Client (https://<vcenter-fqdn>/ui).
+2. Right-click the target Cluster or Host → Deploy OVF Template.
+3. Select 'Local file' → Upload the Move OVA file.
+4. OVF Template Details: Review the summary, click Next.
+5. Name & Folder: Set the VM name (e.g., 'Nutanix-Move-Appliance') and choose the target folder.
+6. Compute Resource: Select the target ESXi host or cluster.
+7. Storage: Select the target datastore — minimum 60 GB required.
+   Disk Provisioning: Thin Provision (recommended to save space).
+8. Network Mapping: Map the Move appliance's network interface to a port group that has:
+   • Access to the vCenter management network
+   • Access to all ESXi host management IPs
+   • Access to the NC2 cluster (Prism Element IP) — via VPN/Direct Connect
+   • Outbound internet access (for Nutanix portal license check — or offline activation)
+9. Customise template (OVF Properties):
+   • Management IP Address: <static IP for Move appliance>
+   • Subnet Mask:           <subnet mask>
+   • Default Gateway:       <gateway IP>
+   • DNS Server:            <DNS IP>
+10. Review the summary and click Finish. Wait for the deployment task to complete (5-10 min).
+11. Power ON the Move appliance VM.
+
+
+📋  Note:  If OVF properties are not available on your vSphere client version, you can configure the IP via the Move VM console after first boot using the set-ip command.
+
+STEP
+6	Initial Configuration of Move Appliance
+	1. Open a browser and navigate to: https://<Move-Appliance-IP>:8443
+2. Accept the self-signed SSL certificate warning.
+3. Create the admin password on first login (minimum 8 characters, mixed case + special char).
+4. Log in with: Username: admin  |  Password: <set in previous step>
+5. (Optional) Configure NTP: Settings → NTP → Add NTP server (e.g., pool.ntp.org or internal NTP).
+6. (Optional) Configure syslog/SMTP for alerting under Settings.
+7. Verify the Move appliance version is displayed on the dashboard.
+8. Check for updates: Settings → Software Upgrade → Check for latest Move release.
+
+
+ 
+5. Configure Source (vCenter) in Nutanix Move
+
+STEP
+7	Add VMware vCenter as Source Environment in Move
+	1. In the Move UI (https://<Move-IP>:8443), click '+ Add Environment'.
+2. Select Environment Type: VMware vCenter.
+3. Fill in the source details:
+   • vCenter IP / FQDN:  <vCenter IP or FQDN>
+   • Port:               443 (default)
+   • Username:           move-svc@vsphere.local  (service account from Step 1)
+   • Password:           <service account password>
+4. Click 'Validate'. Move will test API connectivity to vCenter.
+5. On successful validation, click 'Add'.
+6. The vCenter environment will appear in the Environments list with a green status.
+7. Click the vCenter source → Verify that the VM inventory is populated (Datacenter, Clusters, VMs visible).
+
+
+⚠️  Troubleshooting:  If validation fails — verify TCP 443 is open from the Move appliance to vCenter, and confirm the service account has at least 'Read' access to the root vCenter object.
+
+ 
+6. Configure Target (NC2 / Nutanix AHV) in Nutanix Move
+6.1 NC2 Cluster Preparation
+
+STEP
+8	Validate NC2 Cluster Readiness
+	1. Log in to Prism Element (https://<NC2-Prism-IP>:9440) using cluster admin credentials.
+2. Verify cluster health: Home → Health dashboard — all checks should be green.
+3. Confirm available capacity: Hardware → Diagram → verify CPU, memory, and storage headroom.
+   Recommended minimum free capacity: 120% of total source VM footprint.
+4. Create a dedicated storage container for migrated VMs:
+   Storage → Storage Containers → + Storage Container
+   Name: e.g., 'Migration-Target-Pool'
+   Enable Compression: Yes (recommended for NC2 cloud costs)
+   Enable Deduplication: Optional (enable for identical-data workloads)
+5. Create or confirm target VM networks exist in Prism:
+   Network Configuration → Virtual Networks → confirm VLANs/subnets matching source networks.
+6. Create a Nutanix service account for Move:
+   Settings (gear icon) → Local User Management → + New User
+   Role: Cluster Admin
+   Username: move-target-svc
+
+6.2 Add NC2 as Target in Move
+
+STEP
+9	Add Nutanix NC2 AHV as Target Environment in Move
+	1. In the Move UI, click '+ Add Environment'.
+2. Select Environment Type: Nutanix AHV.
+3. Fill in the target details:
+   • Prism Element IP / FQDN:  <NC2 Prism IP>
+   • Port:                     9440 (default)
+   • Username:                 move-target-svc
+   • Password:                 <service account password>
+4. Click 'Validate'. Move will connect to Prism Element API.
+5. On successful validation, click 'Add'.
+6. The NC2 AHV environment will appear in the Environments list with a green status.
+7. Click the NC2 target → verify Storage Containers and Networks are visible.
+
+
+ 
+7. Network & Firewall Configuration
+
+STEP
+10	Configure Required Firewall Rules
+	Open the following ports. Engage the network/security team to apply ACL rules.
+
+  MOVE APPLIANCE → vCENTER:
+  TCP 443   – vCenter API (VM inventory, snapshot management)
+  TCP 902   – ESXi NFC (Network File Copy) — disk data transfer (agentless mode)
+
+  MOVE APPLIANCE → ESXi HOSTS:
+  TCP 902   – NFC replication data channel
+  TCP 443   – ESXi management API (if direct host access needed)
+
+  MOVE APPLIANCE → NC2 PRISM:
+  TCP 9440  – Prism Element REST API
+  TCP 2049  – NFS (if using NFS datastore on NC2 side)
+
+  SOURCE VM → MOVE APPLIANCE (Agent Mode only):
+  TCP 8088  – Move Agent communication channel
+  TCP 443   – Move appliance HTTPS
+
+  NC2 CVMs (internal, must not be blocked):
+  TCP 2074, 2009, 2020 – Nutanix CVM inter-node communication
+
+  GENERAL:
+  ICMP (ping) – All nodes to all nodes (health checks)
+
+  After applying rules, validate connectivity:
+  From Move appliance console:  nc -zv <vCenter-IP> 443
+  From Move appliance console:  nc -zv <NC2-Prism-IP> 9440
+  From Move appliance console:  nc -zv <ESXi-Host-IP> 902
+
+
+Port	Protocol	Source	Destination	Purpose
+443	TCP	Move Appliance	vCenter	vCenter REST API
+902	TCP	Move Appliance	ESXi Hosts	NFC Disk Replication
+9440	TCP	Move Appliance	Nutanix Prism	Prism Element API
+8088	TCP	Source VMs	Move Appliance	Move Agent (agent mode)
+443	TCP	Source VMs	Move Appliance	Agent HTTPS channel
+2049	TCP	Move Appliance	NC2 Storage	NFS (if applicable)
+ICMP	—	All	All	Health checks
+
+ 
+8. Move Agent Installation on Source VMs (Agent-Based Mode)
+
+📋  When is the Agent Required?  The Move Agent is recommended for production VMs to reduce RPO and improve replication throughput. It is mandatory for VMs hosted on non-vCenter managed ESXi hosts or for physical-to-virtual migrations.
+
+8.1 Pre-Agent Installation Checks
+
+STEP
+11	Verify Guest OS Compatibility for Move Agent
+	Move Agent supports the following operating systems:
+
+  WINDOWS:
+  Windows Server 2008 R2, 2012, 2012 R2, 2016, 2019, 2022
+  Windows 7, 8.1, 10, 11
+  Requires: .NET Framework 4.5+, PowerShell 3.0+, WMI service running
+
+  LINUX:
+  RHEL / CentOS 6.x, 7.x, 8.x, 9.x
+  Ubuntu 14.04, 16.04, 18.04, 20.04, 22.04
+  SLES 11, 12, 15
+  Requires: open-vm-tools or VMware Tools installed, systemd or init.d
+
+  Verify the source VM has network connectivity to Move appliance on TCP 8088 and 443.
+  Confirm firewall on the guest OS allows inbound TCP 8088 from Move appliance IP.
+
+8.2 Windows VM — Move Agent Installation
+
+STEP
+12	Install Move Agent on Windows Source VMs
+	1. Download the Move Agent installer from the Move UI:
+   Move Dashboard → Source Environment → <vCenter> → Select VM → 'Download Agent'
+   Or navigate to: https://<Move-IP>:8443/#/download
+
+2. Copy the installer to the source Windows VM (via RDP, file share, or SCP).
+
+3. On the source Windows VM, run the installer as Administrator:
+   Double-click: NutanixMoveAgent_<version>_windows_amd64.msi
+
+4. During installation, enter when prompted:
+   Move Appliance IP:   <Move-Appliance-IP>
+   Move Appliance Port: 8088
+
+5. Complete the installation wizard. The Move Agent service will start automatically.
+
+6. Verify the agent service is running:
+   Services.msc → Look for 'Nutanix Move Agent' → Status: Running
+   Or via CMD:  sc query NutanixMoveAgent
+
+7. In the Move UI, confirm the VM now shows agent status as 'Connected'.
+
+8. For bulk deployment across multiple Windows VMs, use one of:
+   • Group Policy (GPO) Software Installation
+   • SCCM / Intune software deployment
+   • PowerShell remoting:  Invoke-Command -ComputerName <VM-list> -ScriptBlock { Start-Process msiexec "/i NutanixMoveAgent.msi /quiet MOVE_IP=<IP> MOVE_PORT=8088" }
+
+8.3 Linux VM — Move Agent Installation
+
+STEP
+13	Install Move Agent on Linux Source VMs
+	1. Download the Move Agent RPM or DEB package from the Move UI.
+   Or use curl/wget from the VM:
+   wget https://<Move-IP>:8443/downloads/NutanixMoveAgent_<ver>_linux_amd64.rpm  (for RHEL/CentOS)
+   wget https://<Move-IP>:8443/downloads/NutanixMoveAgent_<ver>_linux_amd64.deb  (for Ubuntu/Debian)
+
+   Note: Accept the self-signed cert: wget --no-check-certificate <url>
+
+2. Install the agent:
+   RHEL/CentOS:  sudo rpm -ivh NutanixMoveAgent_<ver>_linux_amd64.rpm
+   Ubuntu/Debian: sudo dpkg -i NutanixMoveAgent_<ver>_linux_amd64.deb
+
+3. Configure the agent with the Move appliance address:
+   sudo /usr/local/nutanix/move-agent/bin/move-agent configure \
+     --move-ip <Move-Appliance-IP> --move-port 8088
+
+4. Start and enable the agent service:
+   sudo systemctl start move-agent
+   sudo systemctl enable move-agent
+
+5. Verify the agent is running:
+   sudo systemctl status move-agent
+   Expected output: Active: active (running)
+
+6. Check agent connectivity to Move appliance:
+   curl -k https://<Move-IP>:8443/api/v1/vms/agent-status
+
+7. In the Move UI, confirm the Linux VM shows agent status as 'Connected'.
+
+8. For bulk deployment on Linux, use Ansible:
+   - Copy RPM/DEB to all target VMs
+   - Use ansible yum/apt module to install
+   - Use ansible systemd module to start and enable the service
+
+
+ 
+9. Configure Replication (Migration Plan) in Nutanix Move
+
+STEP
+14	Create a Migration Plan in Move
+	1. In the Move UI, click '+ Create a Migration Plan'.
+2. Plan Name: Enter a descriptive name (e.g., 'Wave1-Production-VMs-Apr2026').
+3. Source Environment: Select the vCenter source added in Step 7.
+4. Target Environment: Select the NC2 AHV target added in Step 9.
+5. Click 'Next'.
+
+6. VM SELECTION:
+   Browse the vCenter inventory and select VMs for this migration wave.
+   Group by workload type (e.g., web tier, app tier, database tier) for better control.
+
+7. TARGET CONFIGURATION (per VM or bulk):
+   • Target Container: Select the storage container created in Step 8 (e.g., 'Migration-Target-Pool')
+   • Network Mapping:  Map source vCenter port group → target NC2 network
+   • vCPU / RAM:       Retain source values (or right-size if needed)
+   • VM Name (Target): Auto-populated from source name; modify if needed
+
+8. REPLICATION SETTINGS:
+   • Migration Mode: Agent-based (if agent installed) or Agentless
+   • Bandwidth Throttle: Set if needed (e.g., limit to 100 Mbps during business hours)
+   • Snapshot Retention: Keep 1 snapshot on source during replication
+
+9. SCHEDULE:
+   • Initial Sync: Start immediately or schedule for off-peak hours
+   • Delta Sync Interval: Every 1 hour (adjust based on change rate)
+
+10. Review the migration plan summary and click 'Save'.
+
+
+STEP
+15	Start Replication — Initiate Seed Copy
+	1. In the Move UI, locate the migration plan created in Step 14.
+2. Click 'Start Replication'. Move will perform pre-flight checks:
+   ✓ vCenter source connectivity
+   ✓ NC2 target connectivity
+   ✓ Sufficient storage on target container
+   ✓ VM snapshot ability on source
+   ✓ Agent connectivity (if agent mode)
+
+3. If pre-flight checks pass, Move will begin the initial SEED COPY (full disk replication).
+   This is the longest phase — duration depends on total disk size and available bandwidth.
+   Monitor progress: Move UI → Migration Plan → VM list → % Complete
+
+4. Move will automatically take a VMware snapshot on each source VM to begin CBT tracking.
+   Source VMs remain powered ON and fully operational during this phase.
+
+5. Upon seed copy completion, Move will automatically switch to INCREMENTAL DELTA SYNC mode.
+   Delta syncs will run at the configured interval (e.g., every hour).
+
+6. Monitor the replication health in Move UI:
+   • RPO (Recovery Point Objective) — time since last successful delta sync
+   • Data lag — outstanding data to be replicated
+   • Errors — any VM-level replication failures
+
+
+✅  Replication Running:  Once VMs show status 'Replicating' with a green indicator in Move and delta syncs are completing successfully, replication is established. Proceed to Part 2 of this runbook for migration execution and post-checks.
+
+ 
+10. Replication Validation
+
+STEP
+16	Validate Replication is Running Successfully
+	1. In Move UI, confirm all VMs in the migration plan show status: 'Replicating'.
+2. Verify at least one successful delta sync has completed after the initial seed copy.
+3. In Prism Element (NC2), navigate to Storage → Storage Containers → confirm data is growing
+   in the target container corresponding to replicated VM disk sizes.
+4. Check Move event log for any warnings or errors: Move UI → Events / Alerts.
+5. Validate network latency and throughput metrics are within expected ranges.
+6. Confirm CBT is active on all source VMs: snapshot file (.ctk) exists on source datastore.
+7. Optional — perform a TEST CUTOVER on a non-critical VM:
+   Move UI → Select VM → Test Cutover
+   This powers on a clone of the VM on NC2 in an isolated network for validation.
+   The source VM continues running unaffected.
+8. Verify the test-cutover VM boots correctly on AHV, VirtIO drivers loaded, network assigns IP.
+9. Revert the test cutover after validation: Move UI → Revert Test Cutover.
+
+
+Validation Item	Expected Result	Verified By	Status
+All VMs show 'Replicating' in Move UI	Green / Replicating	Migration Lead	☐
+Seed copy completed with no errors	100% Complete	Migration Lead	☐
+Delta sync completing at set interval	RPO within threshold	Migration Lead	☐
+Target storage container growing (Prism)	Data visible in PE	Nutanix Admin	☐
+No active alerts in Move event log	Zero critical alerts	Migration Lead	☐
+Test cutover VM booted on NC2 successfully	VM online in AHV	App Owner	☐
+Test cutover reverted, source VM unaffected	Source running OK	VMware Admin	☐
+
+ 
+11. Troubleshooting — Replication Phase
+
+Issue	Likely Cause	Resolution
+Move appliance cannot reach vCenter	Firewall blocking TCP 443	Open TCP 443; verify Move appliance IP is in allow-list on vCenter firewall
+VM stuck at 0% seed copy	TCP 902 blocked / CBT not enabled	Open TCP 902 from Move to ESXi; enable CBT on source VM; restart replication
+Move agent shows 'Disconnected'	TCP 8088 blocked or agent service down	Check guest OS firewall; verify move-agent service is running; check Move appliance IP config
+Pre-flight check fails: 'Snapshot failed'	Insufficient datastore space for snapshot	Free up space on source datastore; reduce number of concurrent replications
+Delta sync shows high lag / RPO exceeded	Insufficient bandwidth or high VM change rate	Enable bandwidth throttle; reduce concurrent VMs; schedule delta syncs during off-peak
+Test cutover VM has no network (on NC2)	Network mapping incorrect in Move plan	Review and correct network mappings in the migration plan; re-run test cutover
+Test cutover VM fails to boot / BSOD (Windows)	VirtIO drivers missing / boot config	Install Nutanix VirtIO drivers on source VM before replication; re-seed replication
+Authentication error on NC2 target	Prism credentials changed / expired	Update Prism service account credentials in Move target environment settings
+
+📞  Escalation:  For unresolved Move issues, raise a support case via Nutanix Portal (portal.nutanix.com) and provide the Move support bundle: Move UI → Settings → Collect Logs.
+
+12. Handoff to Part 2
+Once all VMs in scope are in 'Replicating' status with delta syncs completing successfully, and the replication validation checklist in Section 10 is signed off, this runbook (Part 1) is complete.
+
+Proceed to:
+•	PART 2 — Migration Execution & Post-Migration Checks Runbook
+Which covers: final cutover execution, VM validation on NC2, post-migration health checks, DNS/IP updates, decommissioning source VMs, and stakeholder sign-off.
+
+✅  Part 1 Complete:  Ensure all items in the checklists (Section 2 and Section 10) are marked complete and signed off before handing off to the migration execution team.
+
