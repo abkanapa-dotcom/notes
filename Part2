@@ -1,0 +1,511 @@
+
+MIGRATION RUNBOOK
+PART 2 OF 2
+Migration Execution & Post-Migration Checks
+Pre-Cutover Preparation  •  Final Cutover  •  VM Validation  •  Post-Migration Health Checks  •  Decommission
+Field	Details
+Pre-requisite	Part 1 Runbook completed — Replication running for all in-scope VMs
+Source Environment	VMware vCenter (6.5 / 6.7 / 7.0 / 8.x)
+Target Environment	Nutanix NC2 (AHV) — AWS or Azure
+Migration Tool	Nutanix Move (Final Cutover)
+Document Part	Part 2 of 2 — Execution & Post-Checks
+Version	1.0
+Prepared By	[Migration Team / Name]
+Date	April 2026
+
+⚠️  CRITICAL:  This runbook involves powering off source VMs and initiating final cutover — a point of no easy return. Ensure all stakeholders are engaged, a rollback plan is in place, and the change window is approved before proceeding.
+ 
+1. Overview
+This runbook covers all steps required after replication is established — from pre-cutover preparation through final cutover execution, VM validation on NC2, post-migration health checks, application-level testing, and source VM decommissioning.
+
+This document assumes the following from Part 1 are complete:
+•	Nutanix Move appliance is deployed and healthy on vCenter
+•	vCenter source and NC2 AHV target are configured in Move
+•	All in-scope VMs are in 'Replicating' status with delta syncs completing successfully
+•	Test cutover has been performed and validated on at least one VM
+
+1.1 Migration Phases Covered in This Runbook
+Phase	Description	Key Actions
+Phase 1	Pre-Cutover Preparation	Communication, delta sync validation, rollback plan, team readiness
+Phase 2	Final Cutover Execution	Quiesce source VMs, trigger final cutover in Move, IP/MAC update
+Phase 3	Post-Cutover VM Validation	Boot validation, NIC, OS, services, application smoke tests
+Phase 4	Post-Migration Health Checks	Infrastructure, storage, network, monitoring integration
+Phase 5	Source VM Decommissioning	Retain source VMs in powered-off state, then decommission after hold period
+Phase 6	Stakeholder Sign-off	Application owner, infrastructure, and change board sign-off
+
+ 
+2. Pre-Cutover Preparation
+
+📋  Timing:  Pre-cutover preparation should be completed at least 24–48 hours before the migration window. Steps in this section do not impact production VMs.
+
+2.1 Communication & Stakeholder Readiness
+
+STEP
+1	Send Pre-Migration Communication to Stakeholders
+	1. Send migration notification to all relevant stakeholders at least 48 hours in advance:
+   • Application owners and end users (expected downtime window)
+   • IT operations / helpdesk (to manage any incident calls during window)
+   • Management / change board (final approval confirmation)
+   • Network / security teams (on standby during cutover)
+
+2. Communication should include:
+   • Migration window start and end time (with timezone)
+   • List of VMs / applications being migrated
+   • Expected downtime per application
+   • Rollback trigger criteria and rollback timeline
+   • Contact details for migration lead and escalation chain
+
+3. Confirm change window is approved in the Change Management system (ServiceNow / JIRA / etc.).
+
+4. Obtain written/email confirmation from application owners that pre-migration backups are complete.
+
+2.2 Final Replication Health Check
+
+STEP
+2	Validate Replication Status Before Cutover Window
+	1. Log in to Nutanix Move UI (https://<Move-IP>:8443).
+2. For each VM in scope, verify:
+   ✓ Status:          'Replicating' (not paused, errored, or stopped)
+   ✓ Last Delta Sync: Completed within the last 1–2 hours
+   ✓ Data Lag:        < 5 GB (or within acceptable RPO threshold)
+   ✓ Errors:          Zero active errors in Move event log
+
+3. In Prism Element (NC2), verify replicated VM disk files exist in the target container.
+4. Confirm no active snapshots are stuck on source VMs in vCenter.
+5. If any VM shows 'Error' status in Move — resolve the issue before proceeding with cutover.
+   Do NOT cutover VMs with pending replication errors.
+
+6. Trigger a manual delta sync for all VMs immediately before the cutover window:
+   Move UI → Migration Plan → Actions → Sync Now
+7. Wait for manual sync to complete (status: 'Sync Complete') before proceeding.
+
+2.3 Pre-Cutover VM Preparation
+
+STEP
+3	Prepare Source VMs for Cutover
+	1. BACKUP VERIFICATION:
+   Confirm that a full VM backup (via Veeam, Commvault, VADP, or snapshot) exists for all
+   in-scope VMs taken within the last 24 hours. Record backup job IDs / timestamps.
+
+2. APPLICATION QUIESCING PREP:
+   Work with application owners to identify any pre-shutdown steps required:
+   • Database VMs: flush transactions, run checkpoint, put in maintenance mode
+   • Web application VMs: drain active sessions, disable load balancer member
+   • Active Directory / DNS VMs: ensure other DCs are available before shutdown
+   • Clustered services: gracefully fail over clustered roles to non-migrating nodes
+
+3. AGENT CONFIRMATION (if using agent-based mode):
+   Verify Move Agent is connected on all target VMs in Move UI (green status).
+   Run a final agent-triggered sync: Move UI → VM → Force Sync.
+
+4. DNS / IPAM READINESS:
+   Pre-stage DNS record updates (if IP addresses will change post-migration).
+   Confirm DHCP/IPAM scopes are ready on the NC2 network for migrated VMs.
+   If retaining IPs — confirm no IP conflicts exist on the target NC2 subnet.
+
+5. MONITORING SUPPRESSION:
+   Suppress/silence monitoring alerts for the VMs being migrated in the monitoring tool
+   (e.g., Nagios, Zabbix, Prometheus, Datadog, Nutanix Prism Alerts) for the migration window.
+   This prevents alert storms during the planned downtime.
+
+2.4 Rollback Plan
+
+STEP
+4	Document and Confirm Rollback Procedure
+	Rollback Criteria — initiate rollback if ANY of the following occur:
+  • Migrated VM fails to power on NC2 after 3 attempts
+  • Application fails smoke test on NC2 and cannot be resolved within the RTO window
+  • Network connectivity cannot be established on NC2 target VM
+  • Data integrity issue detected (disk size mismatch, corrupted OS)
+
+Rollback Procedure:
+  1. In Move UI: Stop cutover for the affected VM (if final cutover in progress).
+  2. Power off the partially-migrated VM on NC2 (if it was powered on).
+  3. Power ON the source VM on vCenter — it was kept powered off, not deleted.
+     (Move does NOT delete source VMs automatically.)
+  4. Re-enable monitoring alerts for the source VM.
+  5. Notify stakeholders of rollback — restore normal operations on vCenter.
+  6. Investigate root cause in Move logs before re-attempting migration.
+
+Rollback Time Estimate:  5–10 minutes per VM (power on source VM)
+Rollback Decision Authority: Migration Lead + Application Owner
+Maximum time before rollback decision: As per agreed RTO (recommended: 30–60 mins per VM)
+
+
+ 
+3. Final Cutover Execution
+
+🔴  DOWNTIME BEGINS:  Source VMs will be powered off during final cutover. Ensure all pre-cutover steps are complete and the maintenance window is active before proceeding.
+
+STEP
+5	Quiesce and Shut Down Source VM on vCenter
+	Execute for each VM — follow the order: Database VMs → App VMs → Web VMs.
+
+1. If applicable, perform application-level shutdown first:
+   Database: Run SHUTDOWN IMMEDIATE (Oracle) or STOP SERVICE (MSSQL)
+   Web/App: Stop application services gracefully via service manager / startup scripts
+
+2. Log in to the source VM via RDP/SSH and perform a clean OS shutdown:
+   Windows:  Start → Shut Down (or: shutdown /s /t 0)
+   Linux:    sudo shutdown -h now
+
+3. Confirm the VM shows 'Powered Off' in vCenter Web Client.
+   Do NOT force-power off unless the OS does not respond after 5 minutes.
+
+4. Record the exact power-off time for each VM (for RPO calculation and audit).
+
+5. Do NOT remove snapshots or delete VM from vCenter at this stage.
+
+
+STEP
+6	Trigger Final Cutover in Nutanix Move
+	1. Log in to Move UI (https://<Move-IP>:8443).
+2. Navigate to the Migration Plan → select the VM(s) to cut over.
+3. Click 'Cutover' (or 'Finalize Migration') for each VM.
+   Move will perform the following automatically:
+   a) Take a final snapshot of the source VM (powered-off state — crash-consistent).
+   b) Replicate any remaining changed blocks to NC2 (final delta sync).
+   c) Convert the VM disk format to AHV-compatible format (qcow2).
+   d) Inject Nutanix VirtIO drivers (storage and NIC drivers for AHV).
+   e) Update VM boot configuration for AHV (remove VMware tools / VMX references).
+   f) Register the VM on Prism Element (NC2) with the configured vCPU, RAM, network.
+
+4. Monitor the cutover progress in Move UI — typical duration: 5–30 minutes per VM
+   (depends on remaining delta size and network throughput).
+
+5. When Move shows status: 'Cutover Complete' for the VM, proceed to next step.
+
+6. DO NOT power on the target VM in Prism yet — complete the IP/network step first.
+
+
+STEP
+7	Update Network Configuration on Target VM (NC2)
+	1. In Prism Element (NC2), navigate to: VM → locate the migrated VM.
+2. Verify the VM's network adapter is mapped to the correct target network/VLAN.
+   If incorrect: VM → Update → Network Adapters → change to the correct network.
+
+3. IP ADDRESS STRATEGY — choose one:
+
+   OPTION A — Retain Source IP (same subnet / stretched L2):
+   • Ensure the source VM is powered off (to avoid IP conflict).
+   • The migrated VM will request the same IP via DHCP (if DHCP-configured) or via static config.
+   • Verify DHCP reservation exists for the MAC address of the NC2 VM.
+   • Note: The MAC address WILL change after migration — update DHCP reservation if needed.
+     Get new MAC: Prism → VM → Details → Network → MAC Address.
+
+   OPTION B — Assign New IP (different subnet):
+   • Note the new IP to be assigned.
+   • After VM powers on (Step 8), log in and update the guest OS IP configuration:
+     Windows: Network Adapter Settings → set static IP / update DHCP scope
+     Linux:   Edit /etc/sysconfig/network-scripts/ifcfg-ethX or /etc/netplan/*.yaml
+
+4. If DNS records need updating — prepare DNS change (do not apply yet; apply after VM is validated online).
+
+
+ 
+4. Post-Cutover VM Validation
+
+📋  Goal:  Verify the migrated VM is fully functional on NC2 before declaring the migration successful. Perform all checks before enabling production traffic.
+
+4.1 VM Boot and OS Validation
+
+STEP
+8	Power On and Validate VM Boot on NC2 (AHV)
+	1. In Prism Element, select the migrated VM → click 'Power On'.
+2. Open the VM Console: VM → Launch Console (VNC).
+3. Monitor the boot sequence:
+   ✓ BIOS/UEFI POST completes
+   ✓ Bootloader (GRUB / Windows Boot Manager) loads
+   ✓ OS kernel initialises without errors
+   ✓ OS reaches login prompt / desktop / runlevel
+
+4. WINDOWS SPECIFIC BOOT CHECKS:
+   • Confirm no BSOD (Blue Screen of Death) — most common cause: VirtIO driver issues.
+   • If BSOD occurs with INACCESSIBLE_BOOT_DEVICE: Move VirtIO driver injection may have failed.
+     Resolution: Boot from WinPE → inject VirtIO drivers manually → reboot.
+   • Confirm Windows reaches the login screen within 5 minutes.
+   • Log in and verify Windows Event Log: No critical boot errors in System log.
+
+5. LINUX SPECIFIC BOOT CHECKS:
+   • Confirm kernel boots without kernel panic.
+   • Verify dracut/initrd contains VirtIO modules: lsmod | grep virtio
+   • Confirm systemd services start cleanly: systemctl list-units --failed
+   • If VM boots to emergency mode: check /etc/fstab — update any stale disk UUID references.
+     Use: blkid to get new UUIDs on AHV, update /etc/fstab accordingly.
+
+6. Confirm VM hostname is correct: hostname -f (Linux) / hostname (Windows CMD)
+
+4.2 Network Connectivity Validation
+
+STEP
+9	Validate Network Connectivity on Migrated VM
+	1. Within the VM console, verify the NIC is detected and has an IP assigned:
+   Windows:  ipconfig /all
+   Linux:    ip addr show  OR  ifconfig -a
+
+2. Verify the correct IP, subnet mask, and gateway are configured.
+
+3. Test gateway connectivity (confirm VM can reach its default gateway):
+   ping <default-gateway-IP>
+
+4. Test DNS resolution:
+   Windows:  nslookup <internal-hostname>
+   Linux:    dig <internal-hostname> OR nslookup <internal-hostname>
+
+5. Test connectivity to key internal resources:
+   ping <AD Domain Controller IP>
+   ping <DNS Server IP>
+   ping <Application dependency IPs>
+
+6. If IP changed — apply the DNS record update now:
+   Update the A/PTR record for the VM in your DNS management tool.
+   Verify DNS propagation: nslookup <vm-hostname> from another machine.
+
+7. Test RDP/SSH access from the network (not just console):
+   From an external machine: ssh <user>@<new-VM-IP> OR mstsc to <new-VM-IP>
+   Confirm remote access is working before proceeding.
+
+8. If the VM is domain-joined (Windows AD):
+   Verify domain membership: System Properties → Computer Name → Domain
+   Test: nltest /sc_verify:<domain-name>
+   If domain trust broken: Disjoin and rejoin the domain, or use netdom reset.
+
+4.3 Storage and Disk Validation
+
+STEP
+10	Validate Disk and Storage Configuration
+	1. Confirm all disks/volumes are online and accessible:
+   Windows:  Disk Management (diskmgmt.msc) → all volumes show 'Healthy'
+   Linux:    lsblk -f  AND  df -h  (all mount points accessible, correct sizes)
+
+2. Verify disk sizes match the source:
+   Windows:  Get-Disk | Select Number,Size,FriendlyName  (PowerShell)
+   Linux:    lsblk
+
+3. Confirm all mount points / drive letters are correct.
+   Linux: Cat /etc/fstab — verify entries; mount -a to test
+   Windows: Check drive letters in Disk Management
+
+4. Run a basic read/write test on each volume:
+   Linux: dd if=/dev/zero of=/tmp/testfile bs=1M count=512; rm /tmp/testfile
+   Windows: Write a test file to each drive and delete it
+
+5. Verify no snapshot artifacts or .vmdk references are present.
+   On the NC2 VM, there should be clean qcow2 or AHV-format disks only.
+
+6. Check filesystem consistency (optional but recommended):
+   Linux: sudo e2fsck -n /dev/sdX  (non-destructive check)
+   Windows: chkdsk C: (check only — /f flag only if issues found)
+
+4.4 Application and Services Validation
+
+STEP
+11	Validate Application Services and Smoke Test
+	1. Verify critical OS services are running:
+   Windows:  services.msc — check all required services are in 'Running' state
+   Linux:    systemctl list-units --type=service --state=running
+
+2. Check for any failed services:
+   Linux: systemctl --failed
+   Windows: Event Viewer → Windows Logs → System → filter for Error/Critical
+
+3. Start application-specific services (if they were stopped before cutover):
+   Database: Start DB service and verify it initialises correctly
+   Web/App:  Start web server / application server services
+   Middleware: Start queue brokers, caches, etc.
+
+4. SMOKE TESTS — work with application owner to run:
+   • Web application: Load the application URL — verify homepage loads, login works
+   • Database: Connect to DB, run a test query, verify row counts match pre-migration snapshot
+   • API service: Run a sample API call, verify expected response
+   • File shares / NFS: Access shares, read/write a test file
+   • Windows AD / LDAP: Test LDAP bind and user authentication
+
+5. Check application log files for errors post-startup:
+   Look in: /var/log/<app>/, C:\<AppName>\logs\
+
+6. Verify scheduled tasks / cron jobs are present and configured:
+   Linux:    crontab -l  AND  ls /etc/cron.d/
+   Windows:  Task Scheduler → verify tasks exist and next run times are correct
+
+7. Record the application smoke test results — pass/fail per test case.
+
+
+ 
+5. Post-Migration Infrastructure Health Checks
+5.1 Nutanix NC2 Cluster Health
+
+STEP
+12	Validate NC2 Cluster Health Post-Migration
+	1. Log in to Prism Element (https://<NC2-Prism-IP>:9440).
+2. Navigate to Home → Health → verify all health checks pass (green).
+3. Confirm cluster-wide metrics are within normal range:
+   • CPU Utilization:     < 80% across all nodes
+   • Memory Utilization:  < 85% across all nodes
+   • Storage Usage:       < 75% of usable capacity
+   • I/O Latency:         < 2ms average (storage)
+
+4. Verify no degraded CVMs (Controller VMs) or nodes:
+   Prism → Hardware → Diagram → all nodes should be blue/healthy
+   SSH to any CVM: ncc health_checks run_all  (Nutanix health check CLI)
+
+5. Confirm the migrated VMs' storage container has free space:
+   Storage → Storage Containers → check 'Free Space' column.
+
+6. Review Prism Alerts: Prism → Alerts → verify no critical alerts.
+
+7. Verify Nutanix CVM services are all UP:
+   SSH to any CVM: genesis status  (all services should show 'UP')
+
+5.2 VM-Level Performance Baseline
+
+STEP
+13	Establish Performance Baseline on NC2 VMs
+	1. In Prism, navigate to: VM → select migrated VM → Performance tab.
+2. Monitor for the first 30–60 minutes post-migration:
+   • CPU usage:    Compare against pre-migration baseline
+   • Memory usage: Confirm consistent with source
+   • Disk IOPS and throughput: Should meet or exceed source
+   • Network throughput: Verify expected traffic patterns
+
+3. If the migrated VM shows significantly higher CPU or I/O wait than before:
+   • Check if Nutanix storage tiering (SSD/HDD) is optimised — initial data may be on HDD tier.
+   • Run: ncli container ls  to confirm compression/dedup is not over-consuming resources.
+   • Nutanix ILM (Intelligent Lifecycle Management) will auto-tier data to SSD within minutes.
+
+4. For database VMs — run representative workload queries and measure response time.
+   Compare against pre-migration query execution plans and latency.
+
+5. Document the performance baseline readings for post-migration reporting.
+
+5.3 Monitoring & Alerting Integration
+
+STEP
+14	Re-enable Monitoring and Update CMDB
+	1. Re-enable / lift suppression of monitoring alerts for the migrated VMs.
+   Update the VM identifiers (IP, MAC, hostname if changed) in your monitoring tool.
+
+2. Verify monitoring agents are running on the migrated VMs:
+   (e.g., Zabbix Agent, Prometheus Node Exporter, Datadog Agent, SNMP):
+   Linux: systemctl status zabbix-agent / datadog-agent / node_exporter
+   Windows: services.msc → verify monitoring agent service running
+
+3. Confirm the VM appears in the monitoring dashboard and metrics are flowing.
+
+4. Update the CMDB (Configuration Management Database) for each migrated VM:
+   • Update: Hypervisor type (VMware → Nutanix AHV)
+   • Update: Host/Cluster (ESXi cluster → NC2 cluster name)
+   • Update: IP address, MAC address (if changed)
+   • Update: Datastore / Storage (vSAN / VMFS → Nutanix storage container)
+   • Update: Cloud provider / region (if NC2 is on AWS / Azure)
+
+5. Update any load balancer configurations to use the new IP if it changed.
+6. Update firewall rules / security groups to reference the new IP if it changed.
+7. Verify backup jobs are re-enabled and pointing to the NC2 VM:
+   • Nutanix Mine integration (if used)
+   • Veeam Backup for Nutanix AHV (if used)
+   • Or vendor-specific NC2 backup solution
+   • Run a test backup to confirm the backup job completes successfully.
+
+
+ 
+6. Post-Migration Checklist
+Use the table below to sign off all post-migration validation items before declaring the migration complete.
+
+#	Validation Item	Method	Expected Result	Owner	Status
+1	VM powers on successfully on NC2	Prism Console	Boot to OS login	Migration Lead	☐  Pass/Fail
+2	OS boots without errors / BSOD / Panic	Console observation	Clean boot	Migration Lead	☐  Pass/Fail
+3	All disks/volumes online and correct size	OS disk tool	Matches source	Migration Lead	☐  Pass/Fail
+4	IP address assigned correctly	ipconfig / ip addr	Correct IP/subnet	Network Admin	☐  Pass/Fail
+5	DNS resolution working	nslookup / dig	Resolves correctly	Network Admin	☐  Pass/Fail
+6	RDP / SSH remote access working	Remote connection	Login successful	Migration Lead	☐  Pass/Fail
+7	Domain join intact (Windows AD VMs)	nltest / whoami	Domain member OK	Windows Admin	☐  Pass/Fail
+8	All OS services running (no failed svcs)	systemctl / svc	No failed services	Migration Lead	☐  Pass/Fail
+9	Application services started and running	App service check	Services running	App Owner	☐  Pass/Fail
+10	Application smoke test passed	Functional test	All test cases pass	App Owner	☐  Pass/Fail
+11	Monitoring alerts active and metrics flowing	Monitoring tool	Data visible in tool	Ops Team	☐  Pass/Fail
+12	Backup job enabled and test backup passed	Backup console	Backup job successful	Backup Admin	☐  Pass/Fail
+13	CMDB updated with new VM attributes	CMDB record	All fields updated	CMDB Admin	☐  Pass/Fail
+14	NC2 cluster health green post-migration	Prism Health	All checks green	Nutanix Admin	☐  Pass/Fail
+15	Performance baseline within expected range	Prism metrics	CPU/mem/IO normal	Nutanix Admin	☐  Pass/Fail
+16	Load balancer / firewall rules updated	LB / FW config	Traffic routing correct	Network Admin	☐  Pass/Fail
+17	DNS records updated (if IP changed)	DNS lookup	Resolves to new IP	DNS Admin	☐  Pass/Fail
+18	Source VM confirmed powered off in vCenter	vCenter client	Powered Off status	VMware Admin	☐  Pass/Fail
+
+ 
+7. Source VM Decommissioning
+
+⚠️  Hold Period:  Do NOT delete source VMs immediately after migration. Maintain source VMs in powered-off state for a minimum hold period (recommended: 14–30 days) before decommissioning. This provides a safety net for rollback.
+
+STEP
+15	Source VM Retention and Decommissioning Procedure
+	IMMEDIATELY AFTER SUCCESSFUL MIGRATION:
+1. Confirm source VM is powered OFF on vCenter (do not restart).
+2. Add a note/annotation to the source VM in vCenter:
+   'Migrated to NC2 on <date>. Retain until <date + 30 days>. DO NOT DELETE.'
+3. Remove the source VM from any monitoring groups (to avoid false alerts).
+4. Remove the source VM from load balancer pool / DNS (if not already done).
+
+DURING HOLD PERIOD (Days 1–30):
+5. Monitor the migrated VM on NC2 for stability — watch for any issues requiring rollback.
+6. If rollback is needed within the hold period: power on source VM in vCenter (< 5 mins).
+
+AFTER HOLD PERIOD (Day 30+):
+7. Obtain written approval from Application Owner to decommission source VM.
+8. Take a final snapshot/backup of the source VM for archive purposes.
+9. In vCenter: Right-click VM → Delete from Disk (or retain snapshot and remove from inventory).
+10. Remove any associated resources:
+    • vCenter alarms / DRS rules referencing the VM
+    • Source VM backup jobs (cancel/delete in backup tool)
+    • DNS / DHCP reservations for the old IP (if no longer needed)
+11. Reclaim the released vCenter compute and storage capacity.
+12. Update CMDB to mark the source VM record as 'Decommissioned'.
+
+
+ 
+8. Stakeholder Sign-Off
+
+Sign-off Item	Approver Name	Role	Date	Signature
+VM Boot and OS Validation Complete	_______________	Migration Lead	________	___________
+Network Connectivity Validated	_______________	Network Admin	________	___________
+Application Smoke Test Passed	_______________	Application Owner	________	___________
+Monitoring Restored and CMDB Updated	_______________	Ops Team	________	___________
+Backup Jobs Re-enabled and Tested	_______________	Backup Admin	________	___________
+NC2 Cluster Health Verified Post-Migration	_______________	Nutanix Admin	________	___________
+Source VM Retained (Hold Period Acknowledged)	_______________	VMware Admin	________	___________
+Migration Wave Declared Successful	_______________	Migration Lead	________	___________
+
+ 
+9. Troubleshooting — Migration & Post-Migration
+
+Issue	Likely Cause	Resolution
+VM BSOD on boot (Windows)	VirtIO storage driver missing	Boot from WinPE ISO in Prism; inject VirtIO drivers from Nutanix VirtIO ISO; reboot
+Linux kernel panic on boot	initramfs missing VirtIO modules	Boot from rescue ISO; chroot; run dracut -f --regenerate-all; rebuild initrd
+VM boots but no network (no IP)	NIC not mapped / VirtIO NIC driver missing	In Prism, verify NIC mapping; in VM, check 'ip link' — if NIC missing, install virtio-net
+IP conflict after migration	Source VM still powered on / DHCP not updated	Confirm source VM is OFF; update DHCP reservation MAC address to new NC2 VM MAC
+DNS not resolving for migrated VM	DNS A record still points to old IP	Update DNS A and PTR records; verify DNS propagation with nslookup from multiple clients
+Domain join broken after migration	Machine account password expired or MAC changed	Run: netdom resetpwd; or disjoin/rejoin domain in a maintenance window
+Application cannot connect to DB	Firewall rule references old IP	Update security group / firewall rules with new NC2 VM IP
+Backup job failing on NC2 VM	Backup agent not running / old host config	Reinstall or reconfigure backup agent; update backup server with new VM IP/credentials
+High I/O latency post-migration	Data on cold HDD tier (ILM not warmed up)	Wait 15–30 mins for Nutanix ILM to promote data to SSD; check storage tier activity in Prism
+Monitoring agent not reporting metrics	Agent using old IP as report destination	Reconfigure monitoring agent with correct server IP; restart agent service
+Cutover fails with 'disk conversion error'	AHV incompatible disk type (e.g., RDM)	Remove RDM from migration scope; migrate RDM data separately; attach to target VM post-migration
+
+10. Reference: Post-Migration Commands Quick Reference
+
+Task	Windows Command	Linux Command
+Check IP config	ipconfig /all	ip addr show
+Test connectivity	ping <IP>  /  Test-NetConnection	ping <IP>  /  nc -zv <IP> <port>
+Check DNS	nslookup <hostname>	dig <hostname>  /  nslookup <hostname>
+Check disk/volumes	diskmgmt.msc  /  Get-Disk	lsblk -f  /  df -h  /  blkid
+Check services	services.msc  /  Get-Service	systemctl list-units --failed
+Check event/system logs	eventvwr.msc  /  Get-EventLog -Log System	journalctl -xe  /  dmesg | tail -50
+Check VirtIO modules (Linux)	—	lsmod | grep virtio
+Verify domain join (Windows)	nltest /sc_verify:<domain>	—
+Rebuild initrd (Linux)	—	dracut -f --regenerate-all
+Check Nutanix CVM health	—	ncc health_checks run_all  (from any CVM)
+Nutanix CVM services status	—	genesis status  (from any CVM)
+Reset Windows domain trust	netdom resetpwd /s:<DC> /ud:<admin>	—
+
+✅  Runbook Complete:  With all items in Section 6 validated and Section 8 signed off, the migration wave is complete. Archive this runbook with the completed checklists and sign-off records as part of the project closure documentation.
+
